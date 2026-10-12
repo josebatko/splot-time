@@ -1,0 +1,38 @@
+# Slack app manifest. At https://api.slack.com/apps choose
+# "Create New App" → "From a manifest" and paste this file.
+display_information:
+  name: SplotTime
+  description: Track weekly work hours and see weekly to yearly stats.
+  background_color: "#2c2d30"
+
+features:
+  app_home:
+    home_tab_enabled: true
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  bot_user:
+    display_name: SplotTime
+    always_online: true
+  slash_commands:
+    - command: /splot-time
+      description: Log your work hours or see stats
+      usage_hint: "[log 8 comment | log 6 yesterday | stats @user | team | remove | help]"
+      should_escape: true # sends @mentions as user IDs, needed for add/unassign/stats @user
+
+oauth_config:
+  scopes:
+    bot:
+      - commands
+      - chat:write
+      - im:history # read direct messages sent to the app
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_home_opened
+      - message.im
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
