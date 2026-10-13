@@ -54,7 +54,7 @@ The app uses **Socket Mode**, so it needs no public URL. It just needs to stay r
 
 ## Deploying
 
-Any always-on host with Node 20.6+ and a persistent disk works, such as a small VPS, Fly.io or Railway with a volume. Point `DATABASE_PATH` at the persistent volume, since all data lives in one SQLite file. Back it up by copying that file. Set `TZ` to your team's timezone; it decides what "today" means.
+Any always-on host with Node 22 and a persistent disk works, such as a small VPS, Fly.io or Railway with a volume. Point `DATABASE_PATH` at the persistent volume, since all data lives in one SQLite file. Use the SQLite online backup tool in `tools/backup.js`; copying a live WAL database file alone is unsafe. Set `TZ` to your team's timezone; it decides what "today" means.
 
 ## Development
 
@@ -71,3 +71,50 @@ src/
   views.js     Slack Block Kit layouts
   db.js        SQLite storage (members, daily entries)
 ```
+
+
+## Automatic ActivityWatch companion
+
+After one-time setup, SplotTime starts silently at Mac login and uploads selected
+app activity to OVH. Local context rules estimate work from app names, page titles and URLs. Work
+contexts on YouTube or Facebook can count; personal and uncertain activity is
+excluded automatically. These are deterministic heuristics, not semantic AI.
+Mac idle time is excluded and overlapping Mac/iPhone intervals count once.
+No session classification or
+daily approval is required. Reports label imported hours as Automatic estimate;
+manual corrections and deliberate removals always win over later uploads.
+Raw titles and URLs remain on the Mac.
+
+`/splot-time pair` creates a ten-minute one-use code. `/splot-time devices` shows
+capture status; `/splot-time disconnect` revokes the user's devices. Optional
+`/splot-time review` remains available for corrections.
+
+The Apple Silicon Mac bundle includes Python and the iPhone importer. iPhone
+capture requires Screen Time sharing and explicit Mac permissions, and can be
+delayed. Developer signing, notarization and automatic updates remain release
+work. No 100% uptime or zero-maintenance guarantee is made.
+
+See `docs/mac-setup.md` and `docs/ovh.md` for setup details.
+
+
+Privacy update 0.4.1: local setup/status output is restricted to safe health
+fields; activity titles, URLs, identifiers and arbitrary errors are omitted.
+Only synthetic examples should appear in shared diagnostics and recordings.
+ActivityWatch retains raw data locally for classification; it is not erased.
+
+
+## Team installation package and video
+
+- [Complete team installation guide](docs/team-installation.md)
+- [Classification behavior and limits](docs/classification.md)
+- [45-second installation video](docs/videos/SplotTime-Install-Quick-45s.mp4) — real macOS footage with English captions
+- [Video transcript](docs/videos/installation-transcript.md)
+- [Read-only installation check](tools/check-installation.sh)
+
+The video was recorded on an already configured Mac. Extraction and setup
+navigation are shown; first-time app copying, Slack pairing and macOS permission
+approvals are explained rather than performed. iPhone import was not enabled.
+
+The team guide describes the distributed folder, where the installer ZIP,
+AGENTS.md, CLASSIFICATION.md, SHA256SUMS and check-installation.sh sit together.
+Compiled app bundles remain build outputs under dist/; they are not committed.

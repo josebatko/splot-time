@@ -1,3 +1,5 @@
+import { openCompanionStore, companionServer } from './companion.js';
+import { companionCommand, reviewModal } from './companion-slack.js';
 import bolt from '@slack/bolt';
 import { openDb } from './db.js';
 import { isValidDate, today, weekStart } from './periods.js';
@@ -38,6 +40,9 @@ const app = new App({
   logLevel: process.env.LOG_LEVEL || LogLevel.INFO,
 });
 
+const companion = process.env.COMPANION_PUBLIC_URL ? openCompanionStore(process.env.DATABASE_PATH || './data/splot-time.db') : null;
+const ingest = companion ? companionServer(companion, user => canLog(ctx,user), {port:Number(process.env.COMPANION_PORT||5601),host:process.env.COMPANION_HOST||'127.0.0.1',onSnapshot:(user,day,s)=>ctx.db.setAutomaticHours(user,day,s.hours,s.note)}) : null;
+
 async function publishHome(client, userId) {
   const now = ctx.now();
   const member = canLog(ctx, userId);
@@ -58,7 +63,8 @@ async function openLogModal(client, triggerId, userId, date = ctx.now()) {
 }
 
 app.command('/splot-time', async ({ command, ack, client, logger }) => {
-  const result = handleCommand(ctx, command.user_id, command.text ?? '');
+  const result = (companion && companionCommand(companion,ctx,command.user_id,command.text??'',process.env.COMPANION_PUBLIC_URL)) || handleCommand(ctx, command.user_id, command.text ?? '');
+  if(result.review){await ack();await client.views.open({trigger_id:command.trigger_id,view:reviewModal(ctx,command.user_id,result.review)});return;}
 
   if (result.modal) {
     await ack();
@@ -90,7 +96,7 @@ app.action(REMOVE_ENTRY_ACTION, async ({ ack, body, action, client, logger }) =>
   await publishHome(client, userId).catch((e) => logger.error(e));
 });
 
-app.view(LOG_MODAL_ID, async ({ ack, body, view, client, logger }) => {
+const saveLog = async ({ ack, body, view, client, logger }) => {
   const userId = body.user.id;
   const values = view.state.values;
 
@@ -111,6 +117,12 @@ app.view(LOG_MODAL_ID, async ({ ack, body, view, client, logger }) => {
     return;
   }
 
+  if(view.callback_id === 'companion_review') {
+    const meta=JSON.parse(view.private_metadata);
+    if(values.day.date.selected_date!==meta.day || JSON.stringify(ctx.db.getEntry(userId,meta.day))!==JSON.stringify(meta.before)) {
+      await ack({response_action:'errors',errors:{day:'This day changed, or you selected another day. Close and run /splot-time review again.'}});return;
+    }
+  }
   const result = logHours(ctx, userId, values.day.date.selected_date, hours, note);
   if (result.error) {
     await ack({ response_action: 'errors', errors: { day: result.error } });
@@ -121,7 +133,9 @@ app.view(LOG_MODAL_ID, async ({ ack, body, view, client, logger }) => {
   // Posting to a user ID sends a DM from the app, in its Messages tab.
   await client.chat.postMessage({ channel: userId, text: result.text }).catch((e) => logger.error(e));
   await publishHome(client, userId).catch((e) => logger.error(e));
-});
+};
+app.view(LOG_MODAL_ID, saveLog);
+app.view('companion_review', saveLog);
 
 app.event('app_home_opened', async ({ event, client }) => {
   if (event.tab === 'home') await publishHome(client, event.user);
@@ -153,5 +167,7 @@ app.error(async (error) => {
   console.error('SplotTime error:', error);
 });
 
+async function shutdown(){ ingest?.close(); await app.stop(); companion?.close(); ctx.db.close(); process.exit(0); }
+process.once('SIGTERM',shutdown); process.once('SIGINT',shutdown);
 await app.start();
 console.log(`SplotTime is running (biweekly cycle anchored on ${anchor}, ${admins.size} admin(s)).`);

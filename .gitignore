@@ -1,3 +1,11 @@
 node_modules/
 .env
 data/
+
+build/
+dist/
+__pycache__/
+.venv/
+
+.DS_Store
+*.pyc
