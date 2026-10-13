@@ -1,0 +1,7 @@
+[Unit]
+Description=Back up SplotTime using SQLite online backup
+After=docker.service
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker exec splot-time node tools/backup.js
+TimeoutStartSec=120

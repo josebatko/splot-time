@@ -6,12 +6,12 @@
   "type": "module",
   "main": "src/app.js",
   "engines": {
-    "node": ">=20.6"
+    "node": "22.x"
   },
   "scripts": {
     "start": "node src/app.js",
     "dev": "node --env-file=.env src/app.js",
-    "test": "node --test test/"
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "@slack/bolt": "4.7.3",
