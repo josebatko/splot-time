@@ -4,7 +4,13 @@ S='__SERVER__'
 D="$HOME/Library/Application Support/SplotTime"
 AW='http://127.0.0.1:5600/api/0'
 J='Content-Type: application/json'
-fail() { printf 'failed: %s\n' "$1" > "$D/last-sync"; exit 1; }
+C='X-SplotTime-Client: mac'
+# Failures are also reported to the server, so admins see them in /splot-time status.
+fail() {
+  printf 'failed: %s\n' "$1" > "$D/last-sync"
+  printf '{"message":"%s"}' "$1" | curl -fs -m 15 -H @"$D/auth" -H "$J" -H "$C" --data-binary @- -o /dev/null "$S/v1/status"
+  exit 1
+}
 # One run at a time. A lock left by a run that was killed expires after 15 minutes.
 find "$D/lock" -maxdepth 0 -mmin +15 -exec rmdir {} \; 2>/dev/null
 mkdir "$D/lock" 2>/dev/null || exit 0
@@ -17,7 +23,7 @@ if ! curl -fsS -m 5 "$AW/info" >/dev/null 2>&1; then
   done
 fi
 buckets=$(curl -fsS -m 30 "$AW/buckets/") || fail 'could not read ActivityWatch'
-query=$(printf '%s' "$buckets" | curl -sS -m 60 -H @"$D/auth" -H "$J" --data-binary @- -w '\n%{http_code}' "$S/v1/query") || fail 'could not reach the SplotTime server'
+query=$(printf '%s' "$buckets" | curl -sS -m 60 -H @"$D/auth" -H "$J" -H "$C" --data-binary @- -w '\n%{http_code}' "$S/v1/query") || fail 'could not reach the SplotTime server'
 code=$(printf '%s' "$query" | tail -n 1); query=$(printf '%s' "$query" | sed '$d')
 case "$code" in
   200) ;;
@@ -26,6 +32,6 @@ case "$code" in
   *) fail "SplotTime server error $code" ;;
 esac
 result=$(printf '%s' "$query" | curl -fsS -m 300 -H "$J" --data-binary @- "$AW/query/") || fail 'ActivityWatch query failed'
-printf '%s' "$result" | curl -fsS -m 300 -H @"$D/auth" -H "$J" --data-binary @- -o /dev/null "$S/v1/activity" || fail 'upload failed'
+printf '%s' "$result" | curl -fsS -m 300 -H @"$D/auth" -H "$J" -H "$C" --data-binary @- -o /dev/null "$S/v1/activity" || fail 'upload failed'
 printf 'ok %s\n' "$(date)" > "$D/last-sync"
 # end of SplotTime sync

@@ -11,6 +11,9 @@ typed in or edited.
    - `https://crm.usesplot.com/splot-time/install.sh` shows a script
 2. In Slack, add everyone: `/splot-time add @name @name …`
 3. Send each person this page.
+4. Watch progress with `/splot-time status`: everyone you added, their computer,
+   when it last synced and any error it reported. Admins also get a DM at 9 every
+   morning listing anyone who isn't syncing.
 
 ## Mac
 

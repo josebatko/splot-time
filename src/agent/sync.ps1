@@ -8,7 +8,15 @@ $json = 'Content-Type: application/json'
 $lock = Join-Path $D 'lock'
 $files = 'buckets.json', 'query.json', 'result.json' | ForEach-Object { Join-Path $D $_ }
 
+$client = 'X-SplotTime-Client: windows'
 function Finish($message) {
+  # Failures are also reported to the server, so admins see them in /splot-time status.
+  if ($message -like 'failed:*') {
+    $report = Join-Path $D 'status.json'
+    [IO.File]::WriteAllText($report, (@{ message = $message.Substring(8) } | ConvertTo-Json -Compress))
+    & $curl -fs -m 15 -H "@$D\auth" -H $json -H $client --data-binary "@$report" -o NUL "$S/v1/status"
+    Remove-Item $report -Force -ErrorAction SilentlyContinue
+  }
   Remove-Item $files -Force -ErrorAction SilentlyContinue
   Remove-Item $lock -Force -ErrorAction SilentlyContinue
   Set-Content -Path (Join-Path $D 'last-sync') -Value $message
@@ -35,7 +43,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 & $curl -fs -m 30 -o $files[0] "$AW/buckets/"
 if ($LASTEXITCODE -ne 0) { Finish 'failed: could not read ActivityWatch' }
-$code = & $curl -s -m 60 -H "@$D\auth" -H $json --data-binary "@$($files[0])" -o $files[1] -w '%{http_code}' "$S/v1/query"
+$code = & $curl -s -m 60 -H "@$D\auth" -H $json -H $client --data-binary "@$($files[0])" -o $files[1] -w '%{http_code}' "$S/v1/query"
 if ($LASTEXITCODE -ne 0) { Finish 'failed: could not reach the SplotTime server' }
 switch ($code) {
   '200' {}
@@ -45,7 +53,7 @@ switch ($code) {
 }
 & $curl -fs -m 300 -H $json --data-binary "@$($files[1])" -o $files[2] "$AW/query/"
 if ($LASTEXITCODE -ne 0) { Finish 'failed: ActivityWatch query failed' }
-& $curl -fs -m 300 -H "@$D\auth" -H $json --data-binary "@$($files[2])" -o NUL "$S/v1/activity"
+& $curl -fs -m 300 -H "@$D\auth" -H $json -H $client --data-binary "@$($files[2])" -o NUL "$S/v1/activity"
 if ($LASTEXITCODE -ne 0) { Finish 'failed: upload failed' }
 Finish "ok $(Get-Date)"
 # end of SplotTime sync

@@ -51,13 +51,13 @@ export function openCompanionStore(file, now = () => Date.now(), timeZone = proc
     CREATE TABLE IF NOT EXISTS companion_snapshots (device_id TEXT NOT NULL, day TEXT NOT NULL, revision INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(device_id,day));
     DROP TABLE IF EXISTS companion_pairings;`);
   const columns = new Set(db.prepare('PRAGMA table_info(companion_devices)').all().map(c => c.name));
-  for (const [name, type] of [['created','INTEGER'],['delivered','INTEGER'],['query_start','INTEGER'],['nudged','INTEGER NOT NULL DEFAULT 0']])
+  for (const [name, type] of [['created','INTEGER'],['delivered','INTEGER'],['query_start','INTEGER'],['nudged','INTEGER NOT NULL DEFAULT 0'],['client','TEXT'],['error','TEXT'],['error_at','INTEGER']])
     if (!columns.has(name)) db.exec(`ALTER TABLE companion_devices ADD COLUMN ${name} ${type}`);
 
   const getDay = db.prepare('SELECT payload FROM companion_snapshots WHERE device_id=? AND day=?');
   const saveDay = db.prepare(`INSERT INTO companion_snapshots VALUES(?,?,1,?) ON CONFLICT(device_id,day) DO UPDATE SET revision=revision+1,payload=excluded.payload`);
   return {
-    /** One Mac per person: connecting again replaces the previous one. */
+    /** One computer per person: connecting again replaces the previous one. */
     connect: db.transaction(userId => {
       db.prepare('UPDATE companion_devices SET revoked=1 WHERE user_id=?').run(userId);
       const id = secret(), token = secret();
@@ -65,11 +65,15 @@ export function openCompanionStore(file, now = () => Date.now(), timeZone = proc
       return token;
     }),
     identity(token) { return db.prepare('SELECT * FROM companion_devices WHERE token_hash=? AND revoked=0').get(hash(token)); },
-    query(device, buckets) {
+    query(device, buckets, client) {
       const t = now(), start = dayStart(t, LOOKBACK_DAYS, timeZone);
       const q = activityQuery(buckets, start, t + 3600000);
-      db.prepare('UPDATE companion_devices SET query_start=?,seen=?,health=? WHERE id=?').run(q ? start : null, t, q ? 'reading' : 'no-activitywatch-data', device.id);
+      db.prepare('UPDATE companion_devices SET query_start=?,seen=?,health=?,client=COALESCE(?,client) WHERE id=?').run(q ? start : null, t, q ? 'reading' : 'no-activitywatch-data', client, device.id);
       return q;
+    },
+    /** A failed sync reported by the computer itself, e.g. ActivityWatch not running. */
+    reportError(device, message, client) {
+      db.prepare('UPDATE companion_devices SET seen=?,error=?,error_at=?,client=COALESCE(?,client) WHERE id=?').run(now(), String(message).slice(0,200), now(), client, device.id);
     },
     /** Replaces every day the last query covered. Returns the days written. */
     ingest: db.transaction((device, result) => {
@@ -85,10 +89,22 @@ export function openCompanionStore(file, now = () => Date.now(), timeZone = proc
         if (!intervals.length && JSON.parse(getDay.get(device.id, d)?.payload ?? '[]').length) continue;
         saveDay.run(device.id, d, JSON.stringify(intervals));
       }
-      db.prepare('UPDATE companion_devices SET seen=?,delivered=?,health=?,nudged=0 WHERE id=?').run(t,t,'ok',device.id);
+      db.prepare('UPDATE companion_devices SET seen=?,delivered=?,health=?,nudged=0,error=NULL,error_at=NULL WHERE id=?').run(t,t,'ok',device.id);
       return days;
     }),
-    devices(user) { return db.prepare('SELECT id,name,seen,delivered,health,created FROM companion_devices WHERE user_id=? AND revoked=0').all(user); },
+    devices(user) { return db.prepare('SELECT id,name,seen,delivered,health,created,client,error,error_at FROM companion_devices WHERE user_id=? AND revoked=0').all(user); },
+    /** Sync health for every given person, worst first. */
+    overview(users) {
+      const t = now();
+      const rows = users.map(user => {
+        const d = this.devices(user)[0];
+        const state = !d ? 'not-connected' : !d.delivered ? (t - (d.created ?? 0) > 2*3600000 ? 'never-synced' : 'new')
+          : t - d.delivered < 2*3600000 ? 'ok' : t - d.delivered < 48*3600000 ? 'late' : 'silent';
+        return { user, state, device: d ?? null, at: t };
+      });
+      const rank = { silent: 0, 'never-synced': 1, 'not-connected': 2, late: 3, new: 4, ok: 5 };
+      return rows.sort((a, b) => rank[a.state] - rank[b.state]);
+    },
     revoke(user) { db.prepare('UPDATE companion_devices SET revoked=1 WHERE user_id=?').run(user); },
     /** Connected Macs that have not delivered activity for `ms` and were not reminded yet. */
     silent(ms) { return db.prepare(`SELECT id,user_id,delivered,created,health FROM companion_devices WHERE revoked=0 AND nudged=0 AND COALESCE(delivered, created, 0) < ?`).all(now()-ms); },
@@ -104,7 +120,8 @@ export function openCompanionStore(file, now = () => Date.now(), timeZone = proc
   };
 }
 
-const LIMITS = { '/v1/query': 1_000_000, '/v1/activity': 30_000_000 };
+const LIMITS = { '/v1/query': 1_000_000, '/v1/activity': 30_000_000, '/v1/status': 10_000 };
+const client = req => ['mac','windows'].includes(req.headers['x-splottime-client']) ? req.headers['x-splottime-client'] : null;
 
 export function companionServer(store, allowed, {host='127.0.0.1',port=5601,publicUrl=process.env.COMPANION_PUBLIC_URL||'',onSnapshot=()=>{}}={}) {
   // No browser CORS. Only the Mac and Windows sync scripts talk to these endpoints; TLS is provided by the reverse proxy.
@@ -133,9 +150,10 @@ export function companionServer(store, allowed, {host='127.0.0.1',port=5601,publ
       for await(const chunk of req){size+=chunk.length; if(size>LIMITS[path]) return reply(413,{error:'Payload too large'}); chunks.push(chunk);}
       const body=JSON.parse(Buffer.concat(chunks).toString());
       if(path==='/v1/query') {
-        const q=store.query(device,body);
+        const q=store.query(device,body,client(req));
         return q ? reply(200,q) : reply(409,{error:'ActivityWatch has no window and idle data yet'});
       }
+      if(path==='/v1/status') { store.reportError(device, body?.message ?? 'unknown', client(req)); return reply(200,{ok:true}); }
       const days=store.ingest(device,body);
       for(const day of days) await onSnapshot(device.user_id,day,store.suggestion(device.user_id,day));
       return reply(200,{accepted:true,days});

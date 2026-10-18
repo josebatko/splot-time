@@ -4,6 +4,7 @@ import { openDb } from '../src/db.js';
 import { openCompanionStore, companionServer, activityQuery } from '../src/companion.js';
 import { isWork, workByDay } from '../src/classify.js';
 import { installScript, syncScript } from '../src/install-script.js';
+import { companionCommand, problems } from '../src/companion-slack.js';
 
 const now = Date.parse('2026-10-15T16:00:00Z'); // 18:00 in Warsaw
 const ev = (iso, minutes, data) => ({ timestamp: iso, duration: minutes * 60, data });
@@ -130,3 +131,29 @@ test('setup page and install script are public, everything else needs a token', 
     assert.equal((await fetch(url + '/v1/snapshot', { method: 'POST' })).status, 404);
   } finally { await new Promise(r => server.close(r)); }
 });
+
+test('admins see every teammate\'s sync state, with errors the computer reported', () => withServer(async ({ store, db, post, tick }) => {
+  for (const u of ['UOK', 'UERR', 'UNEW', 'UOFF']) db.addMember(u, 'UADMIN');
+  const ok = store.connect('UOK'), err = store.connect('UERR');
+  store.connect('UNEW');
+  await post('/v1/query', ok, buckets, { 'x-splottime-client': 'windows' });
+  await post('/v1/activity', ok, [[ev('2026-10-15T08:00:00Z', 90, { app: 'slack.exe' })]]);
+  await post('/v1/status', err, { message: 'ActivityWatch is not installed' }, { 'x-splottime-client': 'mac' });
+  tick(3 * 3600000);
+  const ctx = { db, admins: new Set(['UADMIN']), now: () => '2026-10-15' };
+  const byUser = Object.fromEntries(store.overview(db.listMembers()).map(r => [r.user, r]));
+  assert.equal(byUser.UOK.state, 'late');
+  assert.equal(byUser.UOK.device.client, 'windows');
+  assert.equal(byUser.UERR.state, 'never-synced');
+  assert.equal(byUser.UOFF.state, 'not-connected');
+  const view = JSON.stringify(companionCommand(store, ctx, 'UADMIN', 'status', 'https://x').blocks);
+  assert.match(view, /<@UOK> · Windows · synced 3 h ago · today 1\.5 h, week 1\.5 h/);
+  assert.match(view, /<@UERR> · Mac · connected 3 h ago, never synced · last error 3 h ago: _ActivityWatch is not installed_/);
+  assert.match(view, /<@UOFF> · not connected/);
+  assert.match(companionCommand(store, ctx, 'UOK', 'status', 'https://x').text, /Only SplotTime admins/);
+  assert.match(companionCommand(store, ctx, 'UOK', 'devices', 'https://x').text, /Windows · synced 3 h ago/);
+  assert.deepEqual(problems(store, ctx).map(r => r.user).sort(), ['UERR', 'UNEW', 'UOFF']);
+  await post('/v1/query', err, buckets);
+  await post('/v1/activity', err, [[]]);
+  assert.equal(store.devices('UERR')[0].error, null);
+}));

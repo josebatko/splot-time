@@ -1,5 +1,5 @@
 import { openCompanionStore, companionServer } from './companion.js';
-import { companionCommand } from './companion-slack.js';
+import { companionCommand, problems, statusBlocks, describe } from './companion-slack.js';
 import bolt from '@slack/bolt';
 import { openDb } from './db.js';
 import { isValidDate, today, weekStart } from './periods.js';
@@ -56,7 +56,19 @@ async function remindSilentComputers() {
     catch (e) { console.error('SplotTime reminder error:', e); }
   }
 }
-const reminders = companion ? setInterval(() => remindSilentComputers().catch(e => console.error('SplotTime reminder error:', e)), 3600000) : null;
+// Every morning at 9, admins get one DM listing anyone whose hours are not arriving.
+let digestDay = null;
+async function adminDigest() {
+  const hour = Number(new Intl.DateTimeFormat('en-GB', { timeZone: process.env.TZ || 'Europe/Warsaw', hour: '2-digit', hourCycle: 'h23' }).format(Date.now()));
+  if (hour !== 9 || digestDay === ctx.now()) return;
+  digestDay = ctx.now();
+  const rows = problems(companion, ctx);
+  if (!rows.length) return;
+  const text = `*SplotTime: ${rows.length} ${rows.length === 1 ? 'person is' : 'people are'} not syncing*\n` + rows.map(r => `• <@${r.user}>: ${describe(r)}`).join('\n') + '\n`/splot-time status` shows everyone.';
+  for (const admin of admins) await app.client.chat.postMessage({ channel: admin, text }).catch(e => console.error('SplotTime digest error:', e));
+}
+const hourly = () => Promise.all([remindSilentComputers(), adminDigest()]).catch(e => console.error('SplotTime reminder error:', e));
+const reminders = companion ? setInterval(hourly, 15 * 60000) : null;
 
 async function publishHome(client, userId) {
   const now = ctx.now();
@@ -67,6 +79,9 @@ async function publishHome(client, userId) {
     recentDays: member ? stats.recentDays(ctx.db, userId, now) : [],
     teamReport: stats.team(ctx.db, ctx.db.listMembers(), 'week', now, anchor),
   });
+  // Admins also see everyone's sync status on their Home tab.
+  if (companion && admins.has(userId)) view.blocks.push({ type: 'divider' }, ...statusBlocks(companion, ctx));
+  view.blocks = view.blocks.slice(0, 100);
   await client.views.publish({ user_id: userId, view });
 }
 

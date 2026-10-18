@@ -133,6 +133,7 @@ export const HELP_TEXT = [
   '*Admin*',
   '`/splot-time add @user` / `unassign @user` assign or unassign people (their hours are kept)',
   '`/splot-time users` lists assigned people',
+  '`/splot-time status` shows whether everyone\'s computer is syncing',
   '',
   '_You can also send me these as a direct message without `/splot-time`, e.g. `stats`. Weeks run Monday to Sunday._',
 ].join('\n');

@@ -13,6 +13,7 @@ A Slack app that records work hours measured by ActivityWatch on each person's M
 | `/splot-time history month [@user]` | anyone | Last 12 periods (`week`, `biweek`, `month`, `quarter`, `year`), or the last 14 days with `day` |
 | `/splot-time team [period] [date]` | anyone | Everyone's totals |
 | `/splot-time users` | anyone | List assigned people |
+| `/splot-time status` | admins | Every teammate's sync state: computer, last sync, last error, today's and this week's hours |
 | `/splot-time add @user …` / `unassign @user …` | admins | Assign or unassign people (unassigning keeps their hours) |
 | `/splot-time help` | anyone | Command list |
 
@@ -89,8 +90,11 @@ memory and thrown away; only start/end times per day are stored.
 
 | Command | What it does |
 |---|---|
-If a connected Mac sends nothing for two days, the app sends its owner one DM
-explaining what to check. Requirements: macOS or Windows 10/11 with
+Observability: each computer reports failed syncs (for example ActivityWatch not
+running) as well as successful ones. Admins see everyone in `/splot-time status`
+and on their Home tab. Every morning at 9 they get one DM listing anyone whose
+hours aren't arriving, and a person whose computer is silent for two days gets a
+DM saying what to check. Requirements: macOS or Windows 10/11 with
 [ActivityWatch](https://activitywatch.net/downloads/) installed, and
 `COMPANION_PUBLIC_URL` set on the server. Colleague setup: [docs/install.md](docs/install.md). See [docs/classification.md](docs/classification.md)
 and [docs/ovh.md](docs/ovh.md).
