@@ -1,11 +1,11 @@
 import { openCompanionStore, companionServer } from './companion.js';
-import { companionCommand, reviewModal } from './companion-slack.js';
+import { companionCommand, problems, statusBlocks, describe } from './companion-slack.js';
 import bolt from '@slack/bolt';
 import { openDb } from './db.js';
 import { isValidDate, today, weekStart } from './periods.js';
 import * as stats from './stats.js';
-import { canLog, cleanNote, handleCommand, logHours, removeHours, validateHours } from './commands.js';
-import { EDIT_ENTRY_ACTION, homeView, logModal, LOG_MODAL_ID, OPEN_LOG_ACTION, REMOVE_ENTRY_ACTION } from './views.js';
+import { canLog, handleCommand } from './commands.js';
+import { homeView } from './views.js';
 
 const { App, LogLevel } = bolt;
 
@@ -41,7 +41,34 @@ const app = new App({
 });
 
 const companion = process.env.COMPANION_PUBLIC_URL ? openCompanionStore(process.env.DATABASE_PATH || './data/splot-time.db') : null;
-const ingest = companion ? companionServer(companion, user => canLog(ctx,user), {port:Number(process.env.COMPANION_PORT||5601),host:process.env.COMPANION_HOST||'127.0.0.1',onSnapshot:(user,day,s)=>ctx.db.setAutomaticHours(user,day,s.hours,s.note)}) : null;
+const ingest = companion ? companionServer(companion, user => canLog(ctx,user), {port:Number(process.env.COMPANION_PORT||5601),host:process.env.COMPANION_HOST||'127.0.0.1',onSnapshot:(user,day,s)=>ctx.db.recordHours(user,day,s.hours)}) : null;
+
+// A computer that has gone quiet for two days gets one DM. The existing connection
+// is left alone, since the computer may simply have been off.
+// Reminders reset after the next successful sync.
+async function remindSilentComputers() {
+  for (const d of companion.silent(48*3600000)) {
+    if (!canLog(ctx, d.user_id)) continue;
+    const text = d.health === 'no-activitywatch-data'
+      ? 'Your computer is connected to SplotTime, but ActivityWatch has no data yet. Open ActivityWatch once; nothing else is needed.'
+      : 'SplotTime has not received activity from your computer for two days, so no hours are being recorded. If it was off, ignore this. Otherwise open ActivityWatch, or run `/splot-time connect` and paste the command again.';
+    try { await app.client.chat.postMessage({ channel: d.user_id, text }); companion.markNudged(d.id); }
+    catch (e) { console.error('SplotTime reminder error:', e); }
+  }
+}
+// Every morning at 9, admins get one DM listing anyone whose hours are not arriving.
+let digestDay = null;
+async function adminDigest() {
+  const hour = Number(new Intl.DateTimeFormat('en-GB', { timeZone: process.env.TZ || 'Europe/Warsaw', hour: '2-digit', hourCycle: 'h23' }).format(Date.now()));
+  if (hour !== 9 || digestDay === ctx.now()) return;
+  digestDay = ctx.now();
+  const rows = problems(companion, ctx);
+  if (!rows.length) return;
+  const text = `*SplotTime: ${rows.length} ${rows.length === 1 ? 'person is' : 'people are'} not syncing*\n` + rows.map(r => `• <@${r.user}>: ${describe(r)}`).join('\n') + '\n`/splot-time status` shows everyone.';
+  for (const admin of admins) await app.client.chat.postMessage({ channel: admin, text }).catch(e => console.error('SplotTime digest error:', e));
+}
+const hourly = () => Promise.all([remindSilentComputers(), adminDigest()]).catch(e => console.error('SplotTime reminder error:', e));
+const reminders = companion ? setInterval(hourly, 15 * 60000) : null;
 
 async function publishHome(client, userId) {
   const now = ctx.now();
@@ -52,122 +79,34 @@ async function publishHome(client, userId) {
     recentDays: member ? stats.recentDays(ctx.db, userId, now) : [],
     teamReport: stats.team(ctx.db, ctx.db.listMembers(), 'week', now, anchor),
   });
+  // Admins also see everyone's sync status on their Home tab.
+  if (companion && admins.has(userId)) view.blocks.push({ type: 'divider' }, ...statusBlocks(companion, ctx));
+  view.blocks = view.blocks.slice(0, 100);
   await client.views.publish({ user_id: userId, view });
 }
 
-/** Opens the logging form, prefilled with what's already logged for that day. */
-async function openLogModal(client, triggerId, userId, date = ctx.now()) {
-  const entry = ctx.db.getEntry(userId, date);
-  const view = logModal({ initialDate: date, initialHours: entry?.hours, initialNote: entry?.note });
-  await client.views.open({ trigger_id: triggerId, view });
-}
-
-app.command('/splot-time', async ({ command, ack, client, logger }) => {
+app.command('/splot-time', async ({ command, ack }) => {
   const result = (companion && companionCommand(companion,ctx,command.user_id,command.text??'',process.env.COMPANION_PUBLIC_URL)) || handleCommand(ctx, command.user_id, command.text ?? '');
-  if(result.review){await ack();await client.views.open({trigger_id:command.trigger_id,view:reviewModal(ctx,command.user_id,result.review)});return;}
-
-  if (result.modal) {
-    await ack();
-    await openLogModal(client, command.trigger_id, command.user_id);
-    return;
-  }
-
   await ack({ response_type: 'ephemeral', text: result.text, blocks: result.blocks });
-  if (result.changed) await publishHome(client, command.user_id).catch((e) => logger.error(e));
 });
-
-app.action(OPEN_LOG_ACTION, async ({ ack, body, client }) => {
-  await ack();
-  await openLogModal(client, body.trigger_id, body.user.id);
-});
-
-// Edit / Log buttons next to a day on the Home tab. The value is the date.
-app.action(EDIT_ENTRY_ACTION, async ({ ack, body, action, client }) => {
-  await ack();
-  if (!isValidDate(action.value)) return;
-  await openLogModal(client, body.trigger_id, body.user.id, action.value);
-});
-
-app.action(REMOVE_ENTRY_ACTION, async ({ ack, body, action, client, logger }) => {
-  await ack();
-  const userId = body.user.id;
-  if (!isValidDate(action.value) || !canLog(ctx, userId)) return;
-  removeHours(ctx, userId, action.value);
-  await publishHome(client, userId).catch((e) => logger.error(e));
-});
-
-const saveLog = async ({ ack, body, view, client, logger }) => {
-  const userId = body.user.id;
-  const values = view.state.values;
-
-  if (!canLog(ctx, userId)) {
-    await ack({ response_action: 'errors', errors: { hours: "You're not set up in SplotTime yet. Ask an admin to add you." } });
-    return;
-  }
-
-  const { hours, error } = validateHours(values.hours.value.value);
-  if (error) {
-    await ack({ response_action: 'errors', errors: { hours: error.replaceAll('`', '') } });
-    return;
-  }
-
-  const { note, error: noteError } = cleanNote(values.note.value.value);
-  if (noteError) {
-    await ack({ response_action: 'errors', errors: { note: noteError } });
-    return;
-  }
-
-  if(view.callback_id === 'companion_review') {
-    const meta=JSON.parse(view.private_metadata);
-    if(values.day.date.selected_date!==meta.day || JSON.stringify(ctx.db.getEntry(userId,meta.day))!==JSON.stringify(meta.before)) {
-      await ack({response_action:'errors',errors:{day:'This day changed, or you selected another day. Close and run /splot-time review again.'}});return;
-    }
-  }
-  const result = logHours(ctx, userId, values.day.date.selected_date, hours, note);
-  if (result.error) {
-    await ack({ response_action: 'errors', errors: { day: result.error } });
-    return;
-  }
-
-  await ack();
-  // Posting to a user ID sends a DM from the app, in its Messages tab.
-  await client.chat.postMessage({ channel: userId, text: result.text }).catch((e) => logger.error(e));
-  await publishHome(client, userId).catch((e) => logger.error(e));
-};
-app.view(LOG_MODAL_ID, saveLog);
-app.view('companion_review', saveLog);
 
 app.event('app_home_opened', async ({ event, client }) => {
   if (event.tab === 'home') await publishHome(client, event.user);
 });
 
 // Direct messages to the app understand the same commands as /splot-time,
-// without the slash: "8 Checkout redesign", "stats", "team day", "help".
-app.message(async ({ message, say, client, logger }) => {
+// without the slash: "stats", "team day", "help".
+app.message(async ({ message, say }) => {
   if (message.channel_type !== 'im' || message.subtype || message.bot_id) return;
   const result = handleCommand(ctx, message.user, message.text ?? '');
-
-  if (result.modal) {
-    // A message can't open the form directly, so offer a button that does.
-    await say({
-      text: 'Log your hours',
-      blocks: [
-        { type: 'section', text: { type: 'mrkdwn', text: 'Tell me your hours, e.g. `8 Checkout redesign` or `6 yesterday`, or open the form:' } },
-        { type: 'actions', elements: [{ type: 'button', action_id: OPEN_LOG_ACTION, value: 'today', style: 'primary', text: { type: 'plain_text', text: 'Log hours' } }] },
-      ],
-    });
-    return;
-  }
-
   await say({ text: result.text, blocks: result.blocks });
-  if (result.changed) await publishHome(client, message.user).catch((e) => logger.error(e));
 });
 
 app.error(async (error) => {
   console.error('SplotTime error:', error);
 });
 
-async function shutdown(){ ingest?.close(); await app.stop(); companion?.close(); ctx.db.close(); process.exit(0); }
+async function shutdown(){ clearInterval(reminders); ingest?.close(); await app.stop(); companion?.close(); ctx.db.close(); process.exit(0); }
 process.once('SIGTERM',shutdown); process.once('SIGINT',shutdown);
 await app.start();
 console.log(`SplotTime is running (biweekly cycle anchored on ${anchor}, ${admins.size} admin(s)).`);

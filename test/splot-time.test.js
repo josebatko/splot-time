@@ -63,65 +63,39 @@ function setup() {
 
 test('assignment and permissions', () => {
   const { run } = setup();
-  assert.match(run('UBOB', 'log 8').text, /not set up/);
+  assert.match(run('UBOB', 'stats').text, /not set up/);
   assert.match(run('UBOB', 'add <@UBOB|bob>').text, /Only SplotTime admins/);
   assert.match(run('UADMIN', 'add <@UBOB|bob> <@UCAROL>').text, /Added <@UBOB>[\s\S]*Added <@UCAROL>/);
-  assert.match(run('UBOB', 'log 8').text, /Logged \*8 h\*/);
+  assert.equal(run('UBOB', 'stats').text, 'SplotTime stats');
   assert.match(run('UADMIN', 'unassign <@UBOB>').text, /Unassigned/);
-  assert.match(run('UBOB', 'log 8').text, /not set up/);
-  assert.match(run('UADMIN', 'remove <@UBOB>').text, /use `\/splot-time unassign/);
+  assert.match(run('UBOB', 'stats').text, /not set up/);
 });
 
-test('logging daily hours', () => {
+test('nobody can type in, change or remove hours, admins included', () => {
   const { db, run } = setup();
   run('UADMIN', 'add <@UBOB>');
-  assert.match(run('UBOB', 'log 8').text, /Wed, Oct 14, 2026/);
-  assert.match(run('UBOB', 'log 7,5').text, /7\.5 h\*.*\(was 8 h\)/);
-  assert.match(run('UBOB', '6 yesterday').text, /Tue, Oct 13/);
-  assert.match(run('UBOB', 'log 4 fri').text, /Fri, Oct 9/);
-  assert.match(run('UBOB', 'log 5 2026-09-16').text, /Wed, Sep 16/);
-  assert.match(run('UBOB', 'log 5 2026-10-15').text, /future day/);
-  assert.match(run('UBOB', 'log 25').text, /24 hours/);
-  assert.match(run('UBOB', 'log abc').text, /must be a number/);
-  assert.equal(db.getHours('UBOB', TODAY), 7.5);
-  assert.equal(db.getHours('UBOB', '2026-10-09'), 4);
-
-  assert.match(run('UBOB', 'remove yesterday').text, /Removed your hours for Tue, Oct 13/);
-  assert.equal(db.getHours('UBOB', '2026-10-13'), null);
-  assert.match(run('UBOB', 'remove yesterday').text, /Nothing was logged/);
-  assert.match(run('UBOB', 'remove').text, /Removed your hours for Wed, Oct 14/);
-  assert.match(run('UBOB', 'remove nonsense').text, /Usage/);
-  assert.equal(run('UBOB', '').modal, true);
-});
-
-test('comments', () => {
-  const { db, run } = setup();
-  run('UADMIN', 'add <@UBOB>');
-  assert.match(run('UBOB', 'log 8 Checkout redesign & <!channel> calls').text, /> Checkout redesign &amp; &lt;!channel&gt; calls/);
-  assert.equal(db.getEntry('UBOB', TODAY).note, 'Checkout redesign & <!channel> calls');
-  run('UBOB', 'log 9'); // no comment keeps the old one
-  assert.deepEqual(db.getEntry('UBOB', TODAY), { hours: 9, note: 'Checkout redesign & <!channel> calls' });
-  run('UBOB', 'log 6 yesterday API Migration');
-  assert.deepEqual(db.getEntry('UBOB', '2026-10-13'), { hours: 6, note: 'API Migration' });
-  run('UBOB', 'log 3 Meetings all day'); // "Meetings" isn't a day, so it's part of the comment
-  assert.equal(db.getEntry('UBOB', TODAY).note, 'Meetings all day');
-  assert.match(run('UBOB', `log 8 ${'x'.repeat(301)}`).text, /under 300/);
-  assert.match(JSON.stringify(run('UBOB', 'history day').blocks), /API Migration/);
+  db.recordHours('UBOB', TODAY, 6);
+  for (const user of ['UBOB', 'UADMIN'])
+    for (const text of ['log 8', '8', '7.5 yesterday', 'remove', 'delete yesterday', 'clear'])
+      assert.match(run(user, text).text, /measured automatically/, text);
+  assert.equal(db.getHours('UBOB', TODAY), 6);
+  assert.equal(run('UBOB', '').text, 'SplotTime stats');
+  db.recordHours('UBOB', TODAY, 0);
+  assert.equal(db.getHours('UBOB', TODAY), null);
+  assert.throws(() => db.recordHours('UBOB', TODAY, 25));
 });
 
 test('everyone can see everyone', () => {
   const { db, run } = setup();
   run('UADMIN', 'add <@UBOB> <@UCAROL>');
-  db.setHours('UCAROL', '2026-10-12', 8, 'Design review');
-  db.setHours('UCAROL', TODAY, 6, 'User interviews');
+  db.recordHours('UCAROL', '2026-10-12', 8);
+  db.recordHours('UCAROL', TODAY, 6);
   assert.match(JSON.stringify(run('UBOB', 'stats <@UCAROL>').blocks), /14 h/);
   assert.match(JSON.stringify(run('UBOB', 'history month <@UCAROL>').blocks), /October 2026/);
   const week = JSON.stringify(run('UBOB', 'team').blocks);
   assert.match(week, /<@UCAROL>: \*14 h\*/);
-  assert.match(week, /Mon, Oct 12: Design review/);
-  assert.match(week, /Wed, Oct 14: User interviews/);
   const day = JSON.stringify(run('UBOB', 'team day').blocks);
-  assert.match(day, /<@UCAROL>: \*6 h\*\\n> User interviews/);
+  assert.match(day, /<@UCAROL>: \*6 h\*/);
   assert.match(day, /<@UBOB>: _nothing logged_/);
   assert.match(run('UBOB', 'users').text, /UCAROL/);
   assert.match(run('UBOB', 'add <@UDAVE>').text, /Only SplotTime admins/);
@@ -130,13 +104,13 @@ test('everyone can see everyone', () => {
 test('stats add up across periods', () => {
   const { db, run } = setup();
   run('UADMIN', 'add <@UBOB>');
-  db.setHours('UBOB', '2026-10-14', 8);
-  db.setHours('UBOB', '2026-10-12', 6);
-  db.setHours('UBOB', '2026-10-09', 7); // last week
-  db.setHours('UBOB', '2026-10-01', 5); // October, but the week of Sep 28
-  db.setHours('UBOB', '2026-09-30', 4); // September
-  db.setHours('UBOB', '2026-06-01', 10); // Q2
-  db.setHours('UBOB', '2025-12-31', 3); // 2025
+  db.recordHours('UBOB', '2026-10-14', 8);
+  db.recordHours('UBOB', '2026-10-12', 6);
+  db.recordHours('UBOB', '2026-10-09', 7); // last week
+  db.recordHours('UBOB', '2026-10-01', 5); // October, but the week of Sep 28
+  db.recordHours('UBOB', '2026-09-30', 4); // September
+  db.recordHours('UBOB', '2026-06-01', 10); // Q2
+  db.recordHours('UBOB', '2025-12-31', 3); // 2025
 
   const byPeriod = Object.fromEntries(stats.summary(db, 'UBOB', TODAY, ANCHOR).map((s) => [s.period, s]));
   assert.equal(byPeriod.week.current.total, 14);
@@ -171,7 +145,7 @@ test('weekly entries from the old schema are migrated', () => {
 
   const db = openDb(file);
   assert.deepEqual(db.getEntry('UBOB', '2026-10-05'), { hours: 40, note: 'Old week' });
-  db.setHours('UBOB', '2026-10-06', 8);
+  db.recordHours('UBOB', '2026-10-06', 8);
   assert.equal(db.sumRange('UBOB', '2026-10-05', '2026-10-11').total, 48);
   db.close();
   assert.deepEqual(openDb(file).getEntry('UBOB', '2026-10-06'), { hours: 8, note: null }); // reopening is a no-op
@@ -181,7 +155,7 @@ test('home tab stays within Slack limits', () => {
   const { db } = setup();
   for (let i = 0; i < 40; i++) {
     db.addMember(`U${i}`);
-    for (let d = 12; d <= 14; d++) db.setHours(`U${i}`, `2026-10-${d}`, 8, 'x'.repeat(300));
+    for (let d = 12; d <= 14; d++) db.recordHours(`U${i}`, `2026-10-${d}`, 8);
   }
   const view = homeView({
     isMember: true,

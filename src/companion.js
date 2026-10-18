@@ -1,12 +1,16 @@
 import { setupPage } from './setup-page.js';
+import { installScript, syncScript, OS_OF } from './install-script.js';
 import { createHash, randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
 import Database from 'better-sqlite3';
-import { isValidDate } from './periods.js';
+import { workByDay, dayOf } from './classify.js';
 
 const hash = s => createHash('sha256').update(s).digest('hex');
 const secret = () => randomBytes(24).toString('base64url');
-export const PROJECTS = ['Product & Engineering', 'Sales & Partnerships', 'Sourcing & Production', 'Marketing & Content', 'Operations & Admin', 'Selected work apps'];
+const DAY = 86400000;
+// Each sync re-reads this many past days, so a Mac that was closed for a while catches up.
+export const LOOKBACK_DAYS = 7;
+
 export function mergeIntervals(intervals) {
   const sorted = intervals.map(x => [x.start, x.end]).sort((a,b) => a[0]-b[0]);
   const out = [];
@@ -16,57 +20,95 @@ export function mergeIntervals(intervals) {
   }
   return out;
 }
-export function validateSnapshot(body, now = Date.now(), timezone = process.env.TZ || 'Europe/Warsaw') {
-  const date = new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' });
-  if (!body || Object.keys(body).some(k => !['day','revision','intervals','health'].includes(k))) throw Error('Unexpected fields');
-  if (!isValidDate(body.day) || !Number.isSafeInteger(body.revision) || body.revision < 1) throw Error('Invalid day or revision');
-  if (!Array.isArray(body.intervals) || body.intervals.length > 3000) throw Error('Too many intervals');
-  const lower = Date.parse(body.day + 'T00:00:00Z') - 14*3600000;
-  const upper = lower + 52*3600000;
-  for (const x of body.intervals) {
-    if (!x || Object.keys(x).some(k => !['start','end','project'].includes(k)) ||
-        !Number.isSafeInteger(x.start) || !Number.isSafeInteger(x.end) || x.end <= x.start ||
-        x.start < lower || x.end > upper || x.end > now+60000 || !PROJECTS.includes(x.project)) throw Error('Invalid interval');
-    if (date.format(x.start) !== body.day || date.format(x.end - 1) !== body.day) throw Error('Interval must be within the team calendar day');
-  }
-  if (!['ok','paused','desktop-unavailable','iphone-stale','iphone-not-configured'].includes(body.health)) throw Error('Invalid health');
-  return body;
+
+/** First instant of the team day `days` days before today. */
+function dayStart(now, days, timeZone) {
+  const target = dayOf(now - days*DAY, timeZone);
+  let lo = now - (days+2)*DAY, hi = now - (days-1)*DAY;
+  while (hi - lo > 1) { const mid = Math.floor((lo+hi)/2); if (dayOf(mid,timeZone) < target) lo = mid; else hi = mid; }
+  return hi;
 }
 
-export function openCompanionStore(file, now = () => Date.now()) {
+/**
+ * ActivityWatch query that returns window events clipped to not-idle time.
+ * Window and idle buckets are paired by hostname; a Mac whose hostname changed
+ * has several pairs and all of them are read. Buckets synced from other machines are ignored.
+ */
+export function activityQuery(buckets, start, end) {
+  const list = Object.values(buckets && typeof buckets === 'object' ? buckets : {}).filter(b => typeof b?.id === 'string' && !b.id.includes('-synced-from-'));
+  const afk = new Map(list.filter(b => b.id.startsWith('aw-watcher-afk_')).map(b => [b.hostname, b.id]));
+  const pairs = list.filter(b => b.id.startsWith('aw-watcher-window_') && afk.has(b.hostname)).map(b => [b.id, afk.get(b.hostname)]);
+  if (!pairs.length) return null;
+  const query = pairs.map(([w,a],i) => `r${i} = filter_period_intersect(flood(query_bucket(${JSON.stringify(w)})), filter_keyvals(flood(query_bucket(${JSON.stringify(a)})), "status", ["not-afk"]));`);
+  query.push(`RETURN = ${pairs.length === 1 ? 'r0' : `concat(${pairs.map((_,i) => 'r'+i).join(', ')})`};`);
+  return { timeperiods: [`${new Date(start).toISOString()}/${new Date(end).toISOString()}`], query };
+}
+
+export function openCompanionStore(file, now = () => Date.now(), timeZone = process.env.TZ || 'Europe/Warsaw') {
   const db = new Database(file);
   db.pragma('journal_mode = WAL');
-  db.exec(`CREATE TABLE IF NOT EXISTS companion_pairings (hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires INTEGER NOT NULL);
-    CREATE TABLE IF NOT EXISTS companion_devices (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL, name TEXT NOT NULL, seen INTEGER, health TEXT, revoked INTEGER NOT NULL DEFAULT 0);
-    CREATE TABLE IF NOT EXISTS companion_snapshots (device_id TEXT NOT NULL, day TEXT NOT NULL, revision INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(device_id,day));`);
-  const pair = db.transaction((code, name) => {
-    const p = db.prepare('SELECT * FROM companion_pairings WHERE hash=? AND expires>?').get(hash(code),now());
-    if (!p) throw Error('Pairing code expired or invalid');
-    const id = secret(), token = secret();
-    db.prepare('DELETE FROM companion_pairings WHERE hash=?').run(hash(code));
-    db.prepare('INSERT INTO companion_devices(id,user_id,token_hash,name) VALUES(?,?,?,?)').run(id,p.user_id,hash(token),name);
-    return {id,token};
-  });
+  db.exec(`CREATE TABLE IF NOT EXISTS companion_devices (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL, name TEXT NOT NULL, seen INTEGER, health TEXT, revoked INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS companion_snapshots (device_id TEXT NOT NULL, day TEXT NOT NULL, revision INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(device_id,day));
+    DROP TABLE IF EXISTS companion_pairings;`);
+  const columns = new Set(db.prepare('PRAGMA table_info(companion_devices)').all().map(c => c.name));
+  for (const [name, type] of [['created','INTEGER'],['delivered','INTEGER'],['query_start','INTEGER'],['nudged','INTEGER NOT NULL DEFAULT 0'],['client','TEXT'],['error','TEXT'],['error_at','INTEGER']])
+    if (!columns.has(name)) db.exec(`ALTER TABLE companion_devices ADD COLUMN ${name} ${type}`);
+
+  const getDay = db.prepare('SELECT payload FROM companion_snapshots WHERE device_id=? AND day=?');
+  const saveDay = db.prepare(`INSERT INTO companion_snapshots VALUES(?,?,1,?) ON CONFLICT(device_id,day) DO UPDATE SET revision=revision+1,payload=excluded.payload`);
   return {
-    pairing(userId) {
-      const code = secret();
-      db.prepare('DELETE FROM companion_pairings WHERE user_id=? OR expires<?').run(userId,now());
-      db.prepare('INSERT INTO companion_pairings VALUES(?,?,?)').run(hash(code),userId,now()+10*60000);
-      return code;
-    },
-    pair,
-    identity(token) { return db.prepare('SELECT * FROM companion_devices WHERE token_hash=? AND revoked=0').get(hash(token)); },
-    upload: db.transaction((device, body) => {
-      validateSnapshot(body,now());
-      const old = db.prepare('SELECT revision,payload FROM companion_snapshots WHERE device_id=? AND day=?').get(device.id,body.day);
-      const payload=JSON.stringify(body.intervals);
-      if(old && old.revision === body.revision && old.payload !== payload) throw Error('Revision conflict');
-      if(!old || old.revision < body.revision) db.prepare(`INSERT INTO companion_snapshots VALUES(?,?,?,?) ON CONFLICT(device_id,day) DO UPDATE SET revision=excluded.revision,payload=excluded.payload`).run(device.id,body.day,body.revision,payload);
-      db.prepare('UPDATE companion_devices SET seen=?,health=? WHERE id=?').run(now(),body.health,device.id);
-      return {accepted: true, revision: Math.max(old?.revision??0,body.revision)};
+    /** One computer per person: connecting again replaces the previous one. */
+    connect: db.transaction(userId => {
+      db.prepare('UPDATE companion_devices SET revoked=1 WHERE user_id=?').run(userId);
+      const id = secret(), token = secret();
+      db.prepare('INSERT INTO companion_devices(id,user_id,token_hash,name,created) VALUES(?,?,?,?,?)').run(id,userId,hash(token),'Mac',now());
+      return token;
     }),
-    devices(user) { return db.prepare('SELECT id,name,seen,health,revoked FROM companion_devices WHERE user_id=?').all(user); },
-    revoke(user) { db.prepare('UPDATE companion_devices SET revoked=1 WHERE user_id=?').run(user); db.prepare('DELETE FROM companion_pairings WHERE user_id=?').run(user); },
+    identity(token) { return db.prepare('SELECT * FROM companion_devices WHERE token_hash=? AND revoked=0').get(hash(token)); },
+    query(device, buckets, client) {
+      const t = now(), start = dayStart(t, LOOKBACK_DAYS, timeZone);
+      const q = activityQuery(buckets, start, t + 3600000);
+      db.prepare('UPDATE companion_devices SET query_start=?,seen=?,health=?,client=COALESCE(?,client) WHERE id=?').run(q ? start : null, t, q ? 'reading' : 'no-activitywatch-data', client, device.id);
+      return q;
+    },
+    /** A failed sync reported by the computer itself, e.g. ActivityWatch not running. */
+    reportError(device, message, client) {
+      db.prepare('UPDATE companion_devices SET seen=?,error=?,error_at=?,client=COALESCE(?,client) WHERE id=?').run(now(), String(message).slice(0,200), now(), client, device.id);
+    },
+    /** Replaces every day the last query covered. Returns the days written. */
+    ingest: db.transaction((device, result) => {
+      const start = db.prepare('SELECT query_start FROM companion_devices WHERE id=?').get(device.id)?.query_start;
+      if (!start || !Array.isArray(result) || result.length !== 1 || !Array.isArray(result[0])) throw Error('Unexpected ActivityWatch result');
+      const t = now(), byDay = workByDay(result[0], timeZone, t), days = [];
+      // Half-day steps so a 23- or 25-hour daylight-saving day is never skipped.
+      for (let ms = start, d = dayOf(ms, timeZone); d <= dayOf(t, timeZone); ms += DAY/2, d = dayOf(ms, timeZone)) {
+        if (days.at(-1) === d) continue;
+        days.push(d);
+        const intervals = (byDay[d] ?? []).filter(x => x.start >= start);
+        // A partial ActivityWatch result (a bucket deleted or renamed) must not erase a day already captured.
+        if (!intervals.length && JSON.parse(getDay.get(device.id, d)?.payload ?? '[]').length) continue;
+        saveDay.run(device.id, d, JSON.stringify(intervals));
+      }
+      db.prepare('UPDATE companion_devices SET seen=?,delivered=?,health=?,nudged=0,error=NULL,error_at=NULL WHERE id=?').run(t,t,'ok',device.id);
+      return days;
+    }),
+    devices(user) { return db.prepare('SELECT id,name,seen,delivered,health,created,client,error,error_at FROM companion_devices WHERE user_id=? AND revoked=0').all(user); },
+    /** Sync health for every given person, worst first. */
+    overview(users) {
+      const t = now();
+      const rows = users.map(user => {
+        const d = this.devices(user)[0];
+        const state = !d ? 'not-connected' : !d.delivered ? (t - (d.created ?? 0) > 2*3600000 ? 'never-synced' : 'new')
+          : t - d.delivered < 2*3600000 ? 'ok' : t - d.delivered < 48*3600000 ? 'late' : 'silent';
+        return { user, state, device: d ?? null, at: t };
+      });
+      const rank = { silent: 0, 'never-synced': 1, 'not-connected': 2, late: 3, new: 4, ok: 5 };
+      return rows.sort((a, b) => rank[a.state] - rank[b.state]);
+    },
+    revoke(user) { db.prepare('UPDATE companion_devices SET revoked=1 WHERE user_id=?').run(user); },
+    /** Connected Macs that have not delivered activity for `ms` and were not reminded yet. */
+    silent(ms) { return db.prepare(`SELECT id,user_id,delivered,created,health FROM companion_devices WHERE revoked=0 AND nudged=0 AND COALESCE(delivered, created, 0) < ?`).all(now()-ms); },
+    markNudged(id) { db.prepare('UPDATE companion_devices SET nudged=1 WHERE id=?').run(id); },
     suggestion(user, day) {
       const rows = db.prepare('SELECT s.payload FROM companion_snapshots s JOIN companion_devices d ON d.id=s.device_id WHERE d.user_id=? AND s.day=? AND d.revoked=0 ORDER BY d.id').all(user,day);
       const intervals = rows.flatMap(r=>JSON.parse(r.payload));
@@ -78,35 +120,46 @@ export function openCompanionStore(file, now = () => Date.now()) {
   };
 }
 
-export function companionServer(store, allowed, {host='127.0.0.1',port=5601,onSnapshot=()=>{}}={}) {
-  // No browser CORS. This endpoint accepts only native paired clients; TLS is provided by the reverse proxy.
+const LIMITS = { '/v1/query': 1_000_000, '/v1/activity': 30_000_000, '/v1/status': 10_000 };
+const client = req => ['mac','windows'].includes(req.headers['x-splottime-client']) ? req.headers['x-splottime-client'] : null;
+
+export function companionServer(store, allowed, {host='127.0.0.1',port=5601,publicUrl=process.env.COMPANION_PUBLIC_URL||'',onSnapshot=()=>{}}={}) {
+  // No browser CORS. Only the Mac and Windows sync scripts talk to these endpoints; TLS is provided by the reverse proxy.
   const server=createServer(async(req,res)=>{
     const reply=(status,body)=>{res.writeHead(status,{'content-type':'application/json','cache-control':'no-store'});res.end(JSON.stringify(body));};
     try {
-      if (['GET','HEAD'].includes(req.method) && new URL(req.url,'http://localhost').pathname === '/') {
+      const path = new URL(req.url,'http://localhost').pathname;
+      if (['GET','HEAD'].includes(req.method) && path === '/') {
         res.writeHead(200, {'content-type':'text/html; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff','content-security-policy':"default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"});
-        return res.end(req.method === 'HEAD' ? undefined : setupPage(process.env.COMPANION_PUBLIC_URL || 'Use the server address provided by /splot-time pair'));
+        return res.end(req.method === 'HEAD' ? undefined : setupPage());
       }
-      if(req.url==='/healthz' && req.method==='GET') return reply(200,{ok:true});
-      if(req.method!=='POST' || !['/v1/pair','/v1/snapshot'].includes(req.url)) return reply(404,{error:'Not found'});
+      if (req.method==='GET' && ['/install.sh','/install.ps1'].includes(path)) {
+        res.writeHead(200,{'content-type':'text/plain; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff'});
+        return res.end(installScript(publicUrl, path.endsWith('.ps1') ? 'windows' : 'mac'));
+      }
+      if (req.method==='GET' && path.startsWith('/agent/') && OS_OF[path.slice(7)]) {
+        res.writeHead(200,{'content-type':'text/plain; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff'});
+        return res.end(syncScript(publicUrl, OS_OF[path.slice(7)]));
+      }
+      if(path==='/healthz' && req.method==='GET') return reply(200,{ok:true});
+      if(req.method!=='POST' || !LIMITS[path]) return reply(404,{error:'Not found'});
       if(req.headers.origin || !String(req.headers['content-type']).startsWith('application/json')) return reply(403,{error:'Native JSON client required'});
-      let data='';
-      for await(const chunk of req){data+=chunk; if(Buffer.byteLength(data)>300000) return reply(413,{error:'Payload too large'});}
-      const body=JSON.parse(data);
-      if(req.url==='/v1/pair') {
-        if(typeof body.code!=='string'||body.code.length>100||typeof body.name!=='string'||body.name.length>80) return reply(400,{error:'Invalid pairing'});
-        // Membership is checked again before accepting each upload.
-        return reply(200,store.pair(body.code,body.name));
-      }
       const device=store.identity(String(req.headers.authorization??'').replace(/^Bearer /,''));
-      if(!device||!allowed(device.user_id)) return reply(401,{error:'Pair again in Slack'});
-      const result=store.upload(device,body);
-      // Retried uploads also retry reporting, using the current merged snapshot.
-      await onSnapshot(device.user_id,body.day,store.suggestion(device.user_id,body.day));
-      return reply(200,result);
-    }catch(error){reply(400,{error: error instanceof SyntaxError?'Invalid JSON':'Invalid request, expired pairing code or revision conflict'});}
+      if(!device||!allowed(device.user_id)) return reply(401,{error:'Run /splot-time connect in Slack again'});
+      const chunks=[];let size=0;
+      for await(const chunk of req){size+=chunk.length; if(size>LIMITS[path]) return reply(413,{error:'Payload too large'}); chunks.push(chunk);}
+      const body=JSON.parse(Buffer.concat(chunks).toString());
+      if(path==='/v1/query') {
+        const q=store.query(device,body,client(req));
+        return q ? reply(200,q) : reply(409,{error:'ActivityWatch has no window and idle data yet'});
+      }
+      if(path==='/v1/status') { store.reportError(device, body?.message ?? 'unknown', client(req)); return reply(200,{ok:true}); }
+      const days=store.ingest(device,body);
+      for(const day of days) await onSnapshot(device.user_id,day,store.suggestion(device.user_id,day));
+      return reply(200,{accepted:true,days});
+    }catch(error){reply(400,{error: error instanceof SyntaxError?'Invalid JSON':'Invalid request'});}
   });
-  server.requestTimeout=15000; server.headersTimeout=10000;
+  server.requestTimeout=120000; server.headersTimeout=10000;
   server.listen(port,host);
   return server;
 }
