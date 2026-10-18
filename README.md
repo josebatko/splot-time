@@ -1,31 +1,22 @@
 # SplotTime
 
-A Slack app for tracking work hours. Each assigned person logs how many hours they worked each day with `/splot-time`, with an optional comment on what they worked on, and everyone can see weekly, biweekly, monthly, quarterly and yearly totals.
+A Slack app that records work hours measured by ActivityWatch on each person's Mac or Windows PC. Nobody can type in or edit hours. Everyone can see weekly, biweekly, monthly, quarterly and yearly totals.
 
 ## Commands
 
 | Command | Who | What it does |
 |---|---|---|
-| `/splot-time` | members | Opens the logging form (day, hours, comment) |
-| `/splot-time log 8` | members | Sets today to 8 h (`/splot-time 8` also works) |
-| `/splot-time log 8 Checkout redesign` | members | Same, with a comment on what you worked on |
-| `/splot-time log 6 yesterday [comment]` | members | Logs yesterday |
-| `/splot-time log 7.5 fri [comment]` | members | Logs the most recent Friday (`mon` … `sun`, today included) |
-| `/splot-time log 8 2026-09-14 [comment]` | members | Logs a specific date |
-| `/splot-time remove [yesterday \| fri \| date]` | members | Deletes a day's entry (today if no day) |
-| `/splot-time stats [@user]` | anyone | Current and previous totals for all five periods, plus the last 7 days |
+| `/splot-time connect` | members | One-line install command for Mac or Windows |
+| `/splot-time devices` | members | When your computer last synced |
+| `/splot-time disconnect` | members | Stops accepting data from your computer |
+| `/splot-time stats [@user]` | anyone | Current and previous totals for all five periods, plus the last 7 days (also just `/splot-time`) |
 | `/splot-time history month [@user]` | anyone | Last 12 periods (`week`, `biweek`, `month`, `quarter`, `year`), or the last 14 days with `day` |
-| `/splot-time team [period] [date]` | anyone | Everyone's totals; for `day` and `week` also their comments |
+| `/splot-time team [period] [date]` | anyone | Everyone's totals |
 | `/splot-time users` | anyone | List assigned people |
 | `/splot-time add @user …` / `unassign @user …` | admins | Assign or unassign people (unassigning keeps their hours) |
 | `/splot-time help` | anyone | Command list |
 
-You can also **message the app directly** with the same commands, minus `/splot-time`: e.g. `8 Checkout redesign`, `6 yesterday`, `stats`, `team day`. Anything it doesn't understand gets a reply with the command list.
-
-The app's **Home tab** in Slack shows your stats, your last 7 days with **Edit** and **Remove** buttons (and **Log** for empty days), and the whole team's hours and comments for this week.
-
-- Logging a day again replaces its hours. When you log from the command without a comment, the day's existing comment is kept. In the form, the comment field is prefilled and saved exactly as you leave it.
-- Hours can't be logged for future days, and a day can hold at most 24 h.
+The same commands work as direct messages to the app, minus `/splot-time`. The **Home tab** shows your stats, your last 7 days and the team's week. There is no way to log, edit or remove hours, for admins either.
 
 ### How periods work
 
@@ -70,51 +61,36 @@ src/
   stats.js     Totals per period
   views.js     Slack Block Kit layouts
   db.js        SQLite storage (members, daily entries)
+  classify.js  What counts as work in ActivityWatch data
+  companion.js Mac sync endpoints and storage
+  install-script.js  Serves the installers in agent/ (Mac and Windows)
 ```
 
 
-## Automatic ActivityWatch companion
+## Automatic hours from ActivityWatch
 
-After one-time setup, SplotTime starts silently at Mac login and uploads selected
-app activity to OVH. Local context rules estimate work from app names, page titles and URLs. Work
-contexts on YouTube or Facebook can count; personal and uncertain activity is
-excluded automatically. These are deterministic heuristics, not semantic AI.
-Mac idle time is excluded and overlapping Mac/iPhone intervals count once.
-No session classification or
-daily approval is required. Reports label imported hours as Automatic estimate;
-manual corrections and deliberate removals always win over later uploads.
-Raw titles and URLs remain on the Mac.
+There is no SplotTime app to install or update. Each person runs
+`/splot-time connect` once and pastes the command it prints: into Terminal on a
+Mac, or into Win + R on Windows. That installs a small curl script
+(`src/agent/`) that launchd or Task Scheduler runs at login and every hour. Each run asks
+ActivityWatch for the last seven days of foreground windows, already clipped to
+not-idle time, and sends them to the server. A Mac that was closed for a while
+catches up on its next run, and closing Terminal changes nothing.
 
-`/splot-time pair` creates a ten-minute one-use code. `/splot-time devices` shows
-capture status; `/splot-time disconnect` revokes the user's devices. Optional
-`/splot-time review` remains available for corrections.
-
-The Apple Silicon Mac bundle includes Python and the iPhone importer. iPhone
-capture requires Screen Time sharing and explicit Mac permissions, and can be
-delayed. Developer signing, notarization and automatic updates remain release
-work. No 100% uptime or zero-maintenance guarantee is made.
-
-See `docs/mac-setup.md` and `docs/ovh.md` for setup details.
+Nothing on a computer ever needs reinstalling. The scheduler starts a tiny
+launcher (`agent/run.*`) that never changes; each run it downloads the current
+sync script from `/agent/sync.sh` or `/agent/sync.ps1` and keeps the last good
+copy if the download fails or looks broken. The server also decides what counts
+as work (`src/classify.js`). So any fix, to the rules or to the sync script, is a
+server deploy and reaches every computer within the hour. Because the server can
+change what runs on everyone's computer, keep its deploy access tight. Window titles and URLs are classified in
+memory and thrown away; only start/end times per day are stored.
 
 
-Privacy update 0.4.1: local setup/status output is restricted to safe health
-fields; activity titles, URLs, identifiers and arbitrary errors are omitted.
-Only synthetic examples should appear in shared diagnostics and recordings.
-ActivityWatch retains raw data locally for classification; it is not erased.
-
-
-## Team installation package and video
-
-- [Complete team installation guide](docs/team-installation.md)
-- [Classification behavior and limits](docs/classification.md)
-- [45-second installation video](docs/videos/SplotTime-Install-Quick-45s.mp4) — real macOS footage with English captions
-- [Video transcript](docs/videos/installation-transcript.md)
-- [Read-only installation check](tools/check-installation.sh)
-
-The video was recorded on an already configured Mac. Extraction and setup
-navigation are shown; first-time app copying, Slack pairing and macOS permission
-approvals are explained rather than performed. iPhone import was not enabled.
-
-The team guide describes the distributed folder, where the installer ZIP,
-AGENTS.md, CLASSIFICATION.md, SHA256SUMS and check-installation.sh sit together.
-Compiled app bundles remain build outputs under dist/; they are not committed.
+| Command | What it does |
+|---|---|
+If a connected Mac sends nothing for two days, the app sends its owner one DM
+explaining what to check. Requirements: macOS or Windows 10/11 with
+[ActivityWatch](https://activitywatch.net/downloads/) installed, and
+`COMPANION_PUBLIC_URL` set on the server. Colleague setup: [docs/install.md](docs/install.md). See [docs/classification.md](docs/classification.md)
+and [docs/ovh.md](docs/ovh.md).

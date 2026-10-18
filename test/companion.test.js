@@ -1,45 +1,132 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { openCompanionStore, validateSnapshot, mergeIntervals, companionServer } from '../src/companion.js';
-const now=Date.parse('2026-10-12T18:00:00Z');
-const body=(revision=1)=>({day:'2026-10-12',revision,health:'ok',intervals:[{start:now-3600000,end:now,project:'Product & Engineering'}]});
-test('pairing is one-use, expires, and tokens are revocable',()=>{
- let t=now;const s=openCompanionStore(':memory:',()=>t);const code=s.pairing('U1');t+=600001;assert.throws(()=>s.pair(code,'Mac'));
- const c=s.pairing('U1'),d=s.pair(c,'Mac');assert.throws(()=>s.pair(c,'Mac'));assert.equal(s.identity(d.token).user_id,'U1');s.revoke('U1');assert.equal(s.identity(d.token),undefined);s.close();
-});
-test('uploads are idempotent, revisions monotonic, users isolated, overlapping devices merged',()=>{
- const s=openCompanionStore(':memory:',()=>now);const a=s.identity(s.pair(s.pairing('U1'),'A').token),b=s.identity(s.pair(s.pairing('U1'),'B').token);
- s.upload(a,body());s.upload(a,body());s.upload(b,body());assert.equal(s.suggestion('U1','2026-10-12').hours,1);assert.equal(s.suggestion('U2','2026-10-12').present,false);
- s.upload(a,{...body(2),intervals:[]});s.upload(a,body());assert.equal(s.suggestion('U1','2026-10-12').hours,1);
- assert.throws(()=>s.upload(b,{...body(),intervals:[]}));s.close();
-});
-test('rejects raw history, invalid interval, future time and invalid category',()=>{
- assert.throws(()=>validateSnapshot({...body(),url:'private'},now));assert.throws(()=>validateSnapshot({...body(),intervals:[{...body().intervals[0],title:'private'}]},now));
- assert.throws(()=>validateSnapshot({...body(),intervals:[{...body().intervals[0],end:now+60001}]},now));
- assert.deepEqual(mergeIntervals([{start:1,end:5},{start:3,end:7},{start:9,end:10}]),[[1,7],[9,10]]);
-});
-test('HTTP upload requires pairing, membership and native request',async()=>{
- const s=openCompanionStore(':memory:',()=>now);let allowed=true;const server=companionServer(s,()=>allowed,{port:0});await new Promise(r=>server.once('listening',r));
- const url='http://127.0.0.1:'+server.address().port;
- try{
- const d=s.pair(s.pairing('U1'),'Mac');const post=(token,extra={})=>fetch(url+'/v1/snapshot',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer '+token,...extra},body:JSON.stringify(body())});
- assert.equal((await post('bad')).status,401);assert.equal((await post(d.token)).status,200);assert.equal((await post(d.token,{origin:'https://evil.test'})).status,403);allowed=false;assert.equal((await post(d.token)).status,401);
- }finally{await new Promise(r=>server.close(r));s.close();}
-});
-test('snapshots cannot count another team calendar day',()=>{
- const midnight=Date.parse('2026-10-12T22:00:00Z');
- const snapshot={...body(),intervals:[{...body().intervals[0],start:midnight-1000,end:midnight}]};
- assert.doesNotThrow(()=>validateSnapshot(snapshot,midnight,'Europe/Warsaw'));
- assert.throws(()=>validateSnapshot({...snapshot,intervals:[{...snapshot.intervals[0],end:midnight+1}]},midnight,'Europe/Warsaw'));
+import { openDb } from '../src/db.js';
+import { openCompanionStore, companionServer, activityQuery } from '../src/companion.js';
+import { isWork, workByDay } from '../src/classify.js';
+import { installScript, syncScript } from '../src/install-script.js';
+
+const now = Date.parse('2026-10-15T16:00:00Z'); // 18:00 in Warsaw
+const ev = (iso, minutes, data) => ({ timestamp: iso, duration: minutes * 60, data });
+const buckets = {
+  'aw-watcher-window_mac': { id: 'aw-watcher-window_mac', hostname: 'mac' },
+  'aw-watcher-afk_mac': { id: 'aw-watcher-afk_mac', hostname: 'mac' },
+  'aw-watcher-window_old.home': { id: 'aw-watcher-window_old.home', hostname: 'old.home' },
+  'aw-watcher-afk_old.home': { id: 'aw-watcher-afk_old.home', hostname: 'old.home' },
+  'aw-watcher-window_x-synced-from-y': { id: 'aw-watcher-window_x-synced-from-y', hostname: 'y' },
+  'aw-watcher-afk_x-synced-from-y': { id: 'aw-watcher-afk_x-synced-from-y', hostname: 'y' },
+};
+
+test('work rules: tools and work sites count, personal and unclear activity does not', () => {
+  for (const d of [{ app: 'Slack' }, { app: 'ChatGPT', title: 'Pricing' }, { app: 'Claude' }, { app: 'Safari', url: 'https://chatgpt.com/c/1' },
+    { app: 'Safari', url: 'https://usesplot.twenty.com/objects' }, { app: 'Google Chrome', url: 'https://i.alibaba.com/x' },
+    { app: 'Safari', url: 'https://www.youtube.com/watch?v=1', title: 'Debugging a React API' },
+    { app: 'Code.exe' }, { app: 'slack.exe' }, { app: 'WindowsTerminal.exe' }, { app: 'chrome.exe', title: 'Pull requests · GitHub - Google Chrome' },
+    { app: 'msedge.exe', title: 'Supplier list - Google Sheets - Microsoft Edge' }]) assert.equal(isWork(d), true, JSON.stringify(d));
+  for (const d of [{ app: 'Hearthstone' }, { app: 'loginwindow' }, { app: 'Safari', url: 'https://www.youtube.com/watch?v=1', title: 'Highlights' },
+    { app: 'ChatGPT', title: 'Dinner recipes' }, { app: 'Safari', url: 'https://github.com/x', incognito: true }, { app: 'Safari', url: 'http://localhost:5600/' },
+    { app: 'Safari' }, { app: 'explorer.exe', title: 'splot' }, { app: 'chrome.exe', title: 'Highlights - YouTube - Google Chrome' }, { app: 'Hearthstone.exe' }]) assert.equal(isWork(d), false, JSON.stringify(d));
 });
 
-test('opening the server address shows setup instructions without granting access',async()=>{
- const server=companionServer({},()=>false,{port:0});await new Promise(r=>server.once('listening',r));
- const url='http://127.0.0.1:'+server.address().port;
- try {
-  const response=await fetch(url+'/');assert.equal(response.status,200);assert.match(response.headers.get('content-type'),/text\/html/);
-  assert.match(await response.text(),/Connect your Mac/);
-  assert.equal((await fetch(url+'/missing')).status,404);
-  assert.equal((await fetch(url+'/v1/pair')).status,404);
- }finally{await new Promise(r=>server.close(r));}
+test('work is merged, clipped to now and split at Warsaw midnight', () => {
+  const days = workByDay([
+    ev('2026-10-14T21:30:00Z', 60, { app: 'Slack' }),          // 23:30–00:30 Warsaw
+    ev('2026-10-14T21:45:00Z', 10, { app: 'Code' }),           // overlaps, counted once
+    ev('2026-10-15T15:30:00Z', 60, { app: 'Slack' }),          // runs past now
+    ev('2026-10-15T10:00:00Z', 60, { app: 'Hearthstone' }),
+  ], 'Europe/Warsaw', now);
+  const minutes = d => days[d].reduce((n, x) => n + x.end - x.start, 0) / 60000;
+  assert.equal(minutes('2026-10-14'), 30);
+  assert.equal(minutes('2026-10-15'), 60);
+});
+
+test('query pairs window and idle buckets per hostname and skips synced ones', () => {
+  const q = activityQuery(buckets, now - 1, now);
+  assert.equal(q.timeperiods.length, 1);
+  assert.equal(q.query.length, 3);
+  assert.match(q.query.at(-1), /RETURN = concat\(r0, r1\);/);
+  assert.doesNotMatch(q.query.join(''), /synced/);
+  assert.equal(activityQuery({ w: { id: 'aw-watcher-window_a', hostname: 'a' } }, 0, 1), null);
+});
+
+test('install scripts embed the server and the sync script, never a token', () => {
+  for (const os of ['mac', 'windows']) {
+    const s = installScript('https://time.example.com/', os);
+    assert.match(s, /S ?= ?'https:\/\/time\.example\.com'/);
+    assert.doesNotMatch(s, /__SERVER__|__SYNC__/);
+  }
+  assert.match(installScript('https://x', 'mac'), /run\.sh<\/string><\/array>[\s\S]*StartInterval/);
+  for (const os of ['mac', 'windows']) assert.match(syncScript('https://x', os), /# end of SplotTime sync\n$/);
+  assert.match(installScript('https://x', 'windows'), /Register-ScheduledTask/);
+});
+
+async function withServer(fn, { allowed = () => true } = {}) {
+  let t = now;
+  const store = openCompanionStore(':memory:', () => t, 'Europe/Warsaw'), db = openDb(':memory:');
+  const server = companionServer(store, u => allowed(u), { port: 0, publicUrl: 'https://time.example.com', onSnapshot: (u, d, s) => db.recordHours(u, d, s.hours) });
+  await new Promise(r => server.once('listening', r));
+  const url = 'http://127.0.0.1:' + server.address().port;
+  const post = (path, token, body, headers = {}) => fetch(url + path, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token, ...headers }, body: JSON.stringify(body) });
+  try { await fn({ store, db, url, post, tick: ms => { t += ms; } }); } finally { await new Promise(r => server.close(r)); store.close(); db.close(); }
+}
+
+test('sync: query, then activity fills the last days and replaces them on the next sync', () => withServer(async ({ store, db, post }) => {
+  const token = store.connect('U1');
+  const q = await post('/v1/query', token, buckets);
+  assert.equal(q.status, 200);
+  const { timeperiods } = await q.json();
+  assert.equal(timeperiods[0].split('/')[0], '2026-10-07T22:00:00.000Z'); // Warsaw midnight, seven days back
+  const r = await post('/v1/activity', token, [[ev('2026-10-15T08:00:00Z', 120, { app: 'Slack', title: 'secret title' }), ev('2026-10-13T08:00:00Z', 30, { app: 'Figma' })]]);
+  assert.deepEqual((await r.json()).days, ['2026-10-08', '2026-10-09', '2026-10-10', '2026-10-11', '2026-10-12', '2026-10-13', '2026-10-14', '2026-10-15']);
+  assert.equal(db.getHours('U1', '2026-10-15'), 2);
+  assert.equal(db.getHours('U1', '2026-10-13'), 0.5);
+  assert.equal(db.getHours('U1', '2026-10-12'), null);
+  assert.equal(store.devices('U1')[0].health, 'ok');
+  await post('/v1/query', token, buckets);
+  await post('/v1/activity', token, [[ev('2026-10-15T08:00:00Z', 60, { app: 'Slack' }), ev('2026-10-13T08:00:00Z', 15, { app: 'Figma' })]]);
+  assert.equal(db.getHours('U1', '2026-10-15'), 1);
+  assert.equal(db.getHours('U1', '2026-10-13'), 0.25);
+  // A result missing a day that was already captured keeps it rather than zeroing it.
+  await post('/v1/query', token, buckets);
+  await post('/v1/activity', token, [[ev('2026-10-15T08:00:00Z', 60, { app: 'Slack' })]]);
+  assert.equal(db.getHours('U1', '2026-10-13'), 0.25);
+}));
+
+test('sync rejects bad tokens, browsers, non-members and activity without a query', () => withServer(async ({ store, post }) => {
+  const token = store.connect('U1');
+  assert.equal((await post('/v1/query', 'bad', buckets)).status, 401);
+  assert.equal((await post('/v1/query', token, buckets, { origin: 'https://evil.test' })).status, 403);
+  assert.equal((await post('/v1/activity', token, [[]])).status, 400);
+  assert.equal((await post('/v1/query', token, {})).status, 409);
+  const again = store.connect('U1');
+  assert.equal((await post('/v1/query', token, buckets)).status, 401);
+  assert.equal((await post('/v1/query', again, buckets)).status, 200);
+}, { allowed: u => u === 'U1' }));
+
+test('silent Macs are reminded once until they sync again', () => withServer(async ({ store, post, tick }) => {
+  const token = store.connect('U1');
+  assert.equal(store.silent(48 * 3600000).length, 0);
+  tick(49 * 3600000);
+  const [d] = store.silent(48 * 3600000);
+  assert.equal(d.user_id, 'U1');
+  store.markNudged(d.id);
+  assert.equal(store.silent(48 * 3600000).length, 0);
+  await post('/v1/query', token, buckets);
+  await post('/v1/activity', token, [[]]);
+  tick(49 * 3600000);
+  assert.equal(store.silent(48 * 3600000).length, 1);
+}));
+
+test('setup page and install script are public, everything else needs a token', async () => {
+  const server = companionServer({}, () => false, { port: 0, publicUrl: 'https://time.example.com' });
+  await new Promise(r => server.once('listening', r));
+  const url = 'http://127.0.0.1:' + server.address().port;
+  try {
+    assert.match(await (await fetch(url + '/')).text(), /Connect your computer/);
+    assert.match(await (await fetch(url + '/install.sh')).text(), /com\.splot\.time\.sync/);
+    assert.match(await (await fetch(url + '/install.ps1')).text(), /SplotTime sync/);
+    assert.match(await (await fetch(url + '/agent/sync.sh')).text(), /S='https:\/\/time\.example\.com'/);
+    assert.match(await (await fetch(url + '/agent/sync.ps1')).text(), /end of SplotTime sync/);
+    assert.equal((await fetch(url + '/agent/run.sh')).status, 404);
+    assert.equal((await fetch(url + '/v1/snapshot', { method: 'POST' })).status, 404);
+  } finally { await new Promise(r => server.close(r)); }
 });

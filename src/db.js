@@ -47,12 +47,8 @@ export function openDb(file) {
     );
   `);
   migrate(db);
-  db.exec(`CREATE TABLE IF NOT EXISTS automatic_entries (user_id TEXT NOT NULL, day TEXT NOT NULL, PRIMARY KEY(user_id,day));
-    CREATE TABLE IF NOT EXISTS entry_overrides (user_id TEXT NOT NULL, day TEXT NOT NULL, PRIMARY KEY(user_id,day));`);
-  const markManual = (user,day) => {
-    db.prepare('DELETE FROM automatic_entries WHERE user_id=? AND day=?').run(user,day);
-    db.prepare('INSERT OR IGNORE INTO entry_overrides VALUES(?,?)').run(user,day);
-  };
+  // Leftovers from when hours could be typed in by hand.
+  db.exec('DROP TABLE IF EXISTS automatic_entries; DROP TABLE IF EXISTS entry_overrides;');
 
   const q = {
     addMember: db.prepare('INSERT OR IGNORE INTO members (user_id, added_by) VALUES (?, ?)'),
@@ -88,29 +84,13 @@ export function openDb(file) {
     getEntry: (userId, day) => q.getEntry.get(userId, day) ?? null,
     getHours: (userId, day) => q.getEntry.get(userId, day)?.hours ?? null,
     /**
-     * Sets (replaces) the hours for a day. Pass `note` as undefined to keep the
-     * existing comment, or null to clear it. Returns the previous hours or null.
+     * Records the hours measured from ActivityWatch for a day, replacing what was
+     * there. This is the only way hours get in: nobody can type or edit them.
      */
-    setHours: db.transaction((userId, day, hours, note) => {
-      const previous = q.getEntry.get(userId, day);
-      markManual(userId,day);
-      q.setEntry.run(userId, day, hours, note === undefined ? previous?.note ?? null : note);
-      return previous?.hours ?? null;
-    }),
-    deleteHours: db.transaction((userId, day) => {
-      markManual(userId,day);
-      return q.deleteEntry.run(userId, day).changes > 0;
-    }),
-    // Existing manual entries and deliberate removals always win over imports.
-    setAutomaticHours: db.transaction((userId,day,hours,note) => {
-      if (!Number.isFinite(hours) || hours<0 || hours>24) throw Error('Invalid automatic hours');
-      if (db.prepare('SELECT 1 FROM entry_overrides WHERE user_id=? AND day=?').get(userId,day)) return false;
-      const owned=db.prepare('SELECT 1 FROM automatic_entries WHERE user_id=? AND day=?').get(userId,day);
-      if (q.getEntry.get(userId,day) && !owned) return false;
-      if (!owned && hours===0) return false;
-      q.setEntry.run(userId,day,hours,('Automatic estimate'+(note ? ': '+note : '')).slice(0,300));
-      db.prepare('INSERT OR IGNORE INTO automatic_entries VALUES(?,?)').run(userId,day);
-      return true;
+    recordHours: db.transaction((userId, day, hours) => {
+      if (!Number.isFinite(hours) || hours < 0 || hours > 24) throw Error('Invalid hours');
+      if (hours === 0) q.deleteEntry.run(userId, day);
+      else q.setEntry.run(userId, day, hours, null);
     }),
 
     /** { total, days } logged in [from, to]. */

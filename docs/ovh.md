@@ -22,7 +22,7 @@ sudo /opt/splot-time/deploy/activate.sh
 The activation script validates required fields without printing secrets, installs
 an HTTPS route, starts the service and enables daily SQLite online backups. It
 stops before activation if configuration is missing. The HTTP port is never
-published directly. Confirm the HTTPS `/healthz` endpoint and `/splot-time pair`
+published directly. Confirm the HTTPS `/healthz` and `/install.sh` endpoints and `/splot-time connect`
 in Slack after activation. Health checks measure HTTP liveness, not Slack delivery.
 
 Backups are verified by SQLite integrity checks and stored at
@@ -33,9 +33,10 @@ recovery. The timer is intentionally disabled until the app is activated.
 Rollback: stop this service with its Compose file and remove only the
 `splot-time.yaml` proxy route. Preserve the data directory and secrets file.
 
-The Mac companion remains a preview. Developer ID signing/notarization, update delivery and end-to-end Apple
-permission testing are outstanding. The importer is included in the Mac bundle.
-No automated team invitations or reminder messages are sent by this deployment.
+There is no Mac app to sign or update. Macs run the curl script served at
+`/install.sh`; the work rules and the ActivityWatch query come from this server.
+The only automatic message is one DM to a person whose connected Mac has sent
+nothing for two days.
 
 ## Verified deployment, 2026-10-12
 
